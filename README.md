@@ -1,5 +1,7 @@
 # Poylgot Creator
-
+```bash
+git clone https://github.com/MDoTrongKhanh/opening-book-creator/
+```
 ```bash
 pip install python-chess
 ```
