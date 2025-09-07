@@ -1,145 +1,70 @@
 import chess
-import chess.pgn
 import chess.polyglot
-import datetime
+import chess.engine
 
-MAX_BOOK_PLIES = 20
-MAX_BOOK_WEIGHT = 10000
+MAX_BOOK_WEIGHT = 1000
 
 def format_zobrist_key_hex(zobrist_key):
     return f"{zobrist_key:016x}"
 
-def get_zobrist_key_hex(board):
-    return format_zobrist_key_hex(chess.polyglot.zobrist_hash(board))
-
 class BookMove:
-    def __init__(self):
-        self.weight = 0
-        self.move = None
+    def __init__(self, move, weight=0):
+        self.move = move
+        self.weight = weight
 
 class BookPosition:
     def __init__(self):
         self.moves = {}
-        self.fen = ""
 
-    def get_move(self, uci):
-        return self.moves.setdefault(uci, BookMove())
+    def add_move(self, move, weight):
+        uci = move.uci()
+        if uci not in self.moves:
+            self.moves[uci] = BookMove(move, weight)
+        else:
+            self.moves[uci].weight += weight
 
 class Book:
     def __init__(self):
         self.positions = {}
-        self.num_positions = 0
-        self.num_moves = 0
 
-    def get_position(self, zobrist_key_hex):
-        return self.positions.setdefault(zobrist_key_hex, BookPosition())
-
-    def normalize_weights(self):
-        for pos in self.positions.values():
-            total_weight = sum(bm.weight for bm in pos.moves.values())
-            if total_weight > 0:
-                for bm in pos.moves.values():
-                    bm.weight = int(bm.weight / total_weight * MAX_BOOK_WEIGHT)
+    def get_position(self, key):
+        if key not in self.positions:
+            self.positions[key] = BookPosition()
+        return self.positions[key]
 
     def save_as_polyglot(self, path):
-        with open(path, 'wb') as outfile:
+        with open(path, "wb") as f:
             entries = []
-
             for key_hex, pos in self.positions.items():
                 zbytes = bytes.fromhex(key_hex)
-
-                for uci, bm in pos.moves.items():
-                    if bm.weight <= 0:
-                        continue
-
+                for bm in pos.moves.values():
                     move = bm.move
                     mi = move.to_square + (move.from_square << 6)
                     if move.promotion:
                         mi += ((move.promotion - 1) << 12)
 
-                    mbytes = mi.to_bytes(2, byteorder="big")
-                    wbytes = bm.weight.to_bytes(2, byteorder="big")
-                    lbytes = (0).to_bytes(4, byteorder="big")
-
-                    entry = zbytes + mbytes + wbytes + lbytes
-                    entries.append(entry)
-
-            entries.sort(key=lambda e: (e[:8], e[10:12]), reverse=False)
+                    mbytes = mi.to_bytes(2, "big")
+                    wbytes = bm.weight.to_bytes(2, "big")
+                    lbytes = (0).to_bytes(4, "big")
+                    entries.append(zbytes + mbytes + wbytes + lbytes)
 
             for entry in entries:
-                outfile.write(entry)
+                f.write(entry)
 
-            print(f"Saved {len(entries)} moves to book: {path}")
-
-    def merge_file(self, path):
-        with chess.polyglot.open_reader(path) as reader:
-            for i, entry in enumerate(reader, start=1):
-                key_hex = format_zobrist_key_hex(entry.key)
-                pos = self.get_position(key_hex)
-                move = entry.move()
-                uci = move.uci()
-
-                bm = pos.get_move(uci)
-                bm.move = move
-                bm.weight += entry.weight
-
-                if i % 10000 == 0:
-                    print(f"Merged {i} moves")
-
-class LichessGame:
-    def __init__(self, game):
-        self.game = game
-
-    def get_id(self):
-        return self.game.headers["Site"].split("/")[-1]
-
-    def get_time(self):
-        dt_str = self.game.headers["UTCDate"] + "T" + self.game.headers["UTCTime"]
-        return datetime.datetime.strptime(dt_str, "%Y.%m.%dT%H:%M:%S").timestamp()
-
-    def result(self):
-        return self.game.headers.get("Result", "*")
-
-    def score(self):
-        res = self.result()
-        return {"1-0": 2, "1/2-1/2": 1}.get(res, 0)
-
-def correct_castling_uci(uci, board):
-    if board.piece_at(chess.parse_square(uci[:2])).piece_type == chess.KING:
-        if uci == "e1g1": return "e1h1"
-        if uci == "e1c1": return "e1a1"
-        if uci == "e8g8": return "e8h8"
-        if uci == "e8c8": return "e8a8"
-    return uci
-
-def build_book_file(pgn_path, book_path):
+def build_book_from_fen(fen, engine_path, book_path, depth=12):
+    board = chess.Board(fen)
     book = Book()
-    with open(pgn_path) as pgn_file:
-        for i, game in enumerate(iter(lambda: chess.pgn.read_game(pgn_file), None), start=1):
-            if i % 100 == 0:
-                print(f"Processed {i} games")
 
-            ligame = LichessGame(game)
-            board = game.board()
-            score = ligame.score()
-            ply = 0
+    with chess.engine.SimpleEngine.popen_uci(engine_path) as engine:
+        result = engine.analyse(board, chess.engine.Limit(depth=depth))
+        best_move = result["pv"][0]  # lấy best move
+        key_hex = format_zobrist_key_hex(chess.polyglot.zobrist_hash(board))
+        pos = book.get_position(key_hex)
+        pos.add_move(best_move, MAX_BOOK_WEIGHT)
 
-            for move in game.mainline_moves():
-                if ply >= MAX_BOOK_PLIES:
-                    break
-
-                uci = correct_castling_uci(move.uci(), board)
-                zobrist_key_hex = get_zobrist_key_hex(board)
-                position = book.get_position(zobrist_key_hex)
-                bm = position.get_move(uci)
-                bm.move = chess.Move.from_uci(uci)
-                bm.weight += score if board.turn == chess.WHITE else (2 - score)
-
-                board.push(move)
-                ply += 1
-
-    book.normalize_weights()
     book.save_as_polyglot(book_path)
+    print(f"Book saved -> {book_path}")
 
 if __name__ == "__main__":
-    build_book_file("chess960.pgn", "960.bin")
+    fen = "rnbqkbnr/pp1p1ppp/2p1p3/8/3PP3/8/PPP2PPP/RNBQKBNR w KQkq - 0 1"
+    build_book_from_fen(fen, "stockfish", "fenbook.bin")
